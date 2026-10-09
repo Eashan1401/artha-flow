@@ -1,0 +1,43 @@
+{
+  "slug": "triage-list",
+  "name": "Triage a list",
+  "description": "Loops over a list of items, asks the agent to rate each one, keeps the ones above a bar. Shows each, filter and JSON answers.",
+  "trigger": { "type": "manual" },
+  "input": {
+    "criteria": "How urgent is this for a small business owner? 1 is ignore, 5 is act today.",
+    "min_score": 4,
+    "items": ["Invoice overdue by 30 days", "Newsletter from a supplier", "Customer says the product arrived broken"]
+  },
+  "nodes": [
+    {
+      "id": "loop", "type": "each", "name": "Rate every item",
+      "config": { "items": "{{ input.items }}", "body": "rate", "maxItems": 50, "stopOnError": false },
+      "next": "report"
+    },
+    {
+      "id": "rate", "type": "claude", "name": "Rate one item",
+      "config": {
+        "system": "You rate items honestly and briefly. Reply with JSON only.",
+        "prompt": "Item: {{ item }}\nQuestion: {{ input.criteria }}\nReturn JSON with the keys score (a whole number 1 to 5) and why (one short sentence).",
+        "expect": "json",
+        "schemaHint": "{\"score\": 1, \"why\": \"text\"}"
+      },
+      "next": "bar"
+    },
+    {
+      "id": "bar", "type": "filter", "name": "Is it above the bar",
+      "config": { "expression": "Number(steps.rate.output.json.score) >= Number(input.min_score)" },
+      "next": "keep", "elseNext": null
+    },
+    {
+      "id": "keep", "type": "write", "name": "Save the keepers",
+      "config": { "path": "triage/{{ run.id }}.txt", "content": "{{ item }} | score {{ steps.rate.output.json.score }} | {{ steps.rate.output.json.why }}\n", "mode": "append", "format": "text" },
+      "next": null
+    },
+    {
+      "id": "report", "type": "log", "name": "Done",
+      "config": { "message": "Rated {{ steps.loop.output.count }} items. Keepers are in data/out/triage/{{ run.id }}.txt", "level": "info" },
+      "next": null
+    }
+  ]
+}

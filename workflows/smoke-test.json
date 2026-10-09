@@ -1,0 +1,53 @@
+{
+  "slug": "smoke-test",
+  "name": "Smoke test",
+  "description": "Proves the whole machine works end to end: it logs, parks a prompt for Claude, transforms the answer, and writes a file.",
+  "trigger": { "type": "manual" },
+  "input": {
+    "topic": "cold coffee"
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "type": "log",
+      "name": "Say hello",
+      "config": {
+        "message": "Smoke test run {{ run.id }} started at {{ run.startedAt }}. Topic is {{ input.topic }}.",
+        "level": "info"
+      },
+      "next": "n2"
+    },
+    {
+      "id": "n2",
+      "type": "claude",
+      "name": "Ask Claude for one line",
+      "config": {
+        "system": "You write short plain English. No em dashes. Answer with the sentence only, no preamble and no sign off.",
+        "prompt": "Give one short sentence about {{ input.topic }}. Plain English, no em dashes. Answer with the sentence only.",
+        "expect": "text"
+      },
+      "next": "n3"
+    },
+    {
+      "id": "n3",
+      "type": "transform",
+      "name": "Measure the answer",
+      "config": {
+        "expression": "(function(){ var t = String(steps.n2.output.text).trim(); var words = t.split(' ').filter(function(w){ return w.length > 0; }).length; return { topic: input.topic, text: t, words: words, chars: t.length, emDashFound: t.indexOf(String.fromCharCode(8212)) !== -1 }; } )()"
+      },
+      "next": "n4"
+    },
+    {
+      "id": "n4",
+      "type": "write",
+      "name": "Save the report",
+      "config": {
+        "path": "smoke/{{ run.id }}.txt",
+        "content": "ARTHA FLOW smoke test\nRun: {{ run.id }}\nStarted: {{ run.startedAt }}\nTopic: {{ steps.n3.output.value.topic }}\n\nClaude said: {{ steps.n3.output.value.text }}\n\nWords: {{ steps.n3.output.value.words }}\nCharacters: {{ steps.n3.output.value.chars }}\nEm dash found: {{ steps.n3.output.value.emDashFound }}\n\nAll four parts worked: log, claude, transform, write.\n",
+        "mode": "overwrite",
+        "format": "text"
+      },
+      "next": null
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+# Runtime state, never committed
+data/
+node_modules/
+package-lock.json
+npm-debug.log*
+
+# Editor and OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Secrets never live in here
+.env
+.env.*

@@ -1,0 +1,33 @@
+{
+  "slug": "summarize-url",
+  "name": "Summarize a web page",
+  "description": "Fetches a page, asks the agent for a three bullet summary, saves it. Shows http, claude, transform and write working together.",
+  "trigger": { "type": "manual" },
+  "input": { "url": "https://example.com" },
+  "nodes": [
+    {
+      "id": "fetch", "type": "http", "name": "Fetch the page",
+      "config": { "url": "{{ input.url }}", "method": "GET", "expect": "text", "timeoutMs": 20000 },
+      "next": "trim"
+    },
+    {
+      "id": "trim", "type": "transform", "name": "Cut the page to 6000 characters",
+      "config": { "expression": "String(steps.fetch.output.body).replace(/<script[\\s\\S]*?<\\/script>|<style[\\s\\S]*?<\\/style>|<[^>]+>/g, ' ').replace(/\\s+/g, ' ').slice(0, 6000)" },
+      "next": "summarize"
+    },
+    {
+      "id": "summarize", "type": "claude", "name": "Summarize",
+      "config": {
+        "system": "You write short, plain English. You only use facts that are in the text you are given.",
+        "prompt": "Summarize this page in exactly three bullet points. Start each line with a dash. Page text:\n\n{{ steps.trim.output.value }}",
+        "expect": "text"
+      },
+      "next": "save"
+    },
+    {
+      "id": "save", "type": "write", "name": "Save the summary",
+      "config": { "path": "summaries/{{ run.id }}.md", "content": "# {{ input.url }}\n\n{{ steps.summarize.output.text }}\n", "mode": "overwrite", "format": "text" },
+      "next": null
+    }
+  ]
+}

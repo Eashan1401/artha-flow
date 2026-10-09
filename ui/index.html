@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARTHA FLOW</title>
+<meta name="description" content="ARTHA FLOW. Local workflow engine. Run a workflow, watch it live, answer the prompts it parks.">
+<meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<!-- Local only. No CDN, no web fonts, no analytics, no outside call of any kind.
+     This page works with the network cable pulled out. -->
+<!-- Design tokens, copied from the ARTHA OS's tokens.css. Every colour style.css
+     and graph.css use comes from a var() defined here. -->
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="style.css">
+<!-- The landscape canvas. graph-canvas.js loads it lazily, this just makes it
+     available. A missing file here is silent, no error, the canvas view falls
+     back to the stacked list on its own. See app.js, canvasModules(). -->
+<link rel="stylesheet" href="graph.css">
+<!-- The only CSS app.js needs that graph.css does not own: the canvas plus
+     side panel row on the workflow page stacks under it instead of squeezing
+     to a sliver on a narrow screen. Targets only the ids app.js builds, so it
+     cannot collide with anything graph.css or style.css already owns. -->
+<style>
+  @media (max-width: 860px) {
+    #wfd-canvas-row { flex-direction: column; }
+    #wfd-canvas-host { height: 420px; width: 100%; }
+    #wfd-node-panel { width: 100% !important; flex: 0 0 auto !important; max-height: 420px; }
+  }
+</style>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b0d10'/%3E%3Cpath d='M9 23V9h13M9 16h9' stroke='%23e6edf3' stroke-width='2.6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<a class="skip" href="#view">Skip to the page</a>
+
+<div class="app">
+
+  <!-- ===================================================================
+       Topbar. Same shape as the ARTHA OS topbar: wordmark, tabs, status on
+       the right. The connection dot is the one thing that must never lie,
+       so it has a word next to it and not only a colour.
+       =================================================================== -->
+  <header class="topbar" role="banner">
+    <span class="wordmark">ARTHA <strong>FLOW</strong></span>
+
+    <nav class="nav" aria-label="Pages">
+      <a class="nav-tab" href="#/workflows" data-tab="workflows">Workflows</a>
+      <a class="nav-tab" href="#/runs" data-tab="runs">Runs</a>
+      <a class="nav-tab" href="#/inbox" data-tab="inbox">
+        Inbox
+        <span class="badge" id="inbox-badge" hidden>0</span>
+      </a>
+    </nav>
+
+    <span class="spacer"></span>
+
+    <span class="topbar-meta mono" id="health-meta" title="Server version and how long it has been up"></span>
+
+    <button class="conn" id="conn" type="button" data-state="down"
+            title="Live connection to the server. Click to reconnect now.">
+      <span class="conn-dot" aria-hidden="true"></span>
+      <span class="conn-text" id="conn-text">Connecting</span>
+    </button>
+  </header>
+
+  <!-- Server trouble shows here, above every view, and never as a blank page. -->
+  <div id="alert-host" class="alert-host"></div>
+
+  <!-- A run parked on a person is the only genuinely urgent state this system
+       has. It shows here, above every view, wherever you are on the page, not
+       just as a badge in the Inbox tab. See needsYou in app.js. -->
+  <div id="needs-you-host"></div>
+
+  <main class="view" id="view" tabindex="-1">
+    <div class="empty">
+      <p class="empty-title">Loading</p>
+    </div>
+  </main>
+
+</div>
+
+<!-- The run input dialog, opened from a workflow card. -->
+<dialog class="dialog" id="run-dialog" aria-labelledby="run-dialog-title">
+  <form method="dialog" class="dialog-form" id="run-form">
+    <div class="dialog-head">
+      <div>
+        <p class="eyebrow">Start a run</p>
+        <h2 class="dialog-title" id="run-dialog-title">Workflow</h2>
+      </div>
+      <button class="btn-icon" type="button" id="run-cancel" aria-label="Close">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+
+    <label class="field-label" for="run-input">Input JSON</label>
+    <p class="field-help">This is the workflow's own input block. Change it if you want, or leave it as it is.</p>
+    <textarea class="code-input" id="run-input" spellcheck="false" rows="10"></textarea>
+    <p class="field-error" id="run-error" hidden></p>
+
+    <div class="dialog-foot">
+      <button class="btn" type="button" id="run-close">Cancel</button>
+      <button class="btn btn-primary" type="button" id="run-go">Run it</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- The add a step dialog, opened from a plus between two steps on a workflow
+     page. Everything inside it is built from GET /api/nodes at open time, so a
+     new node type on the server appears here on its own. -->
+<dialog class="dialog dialog-wide" id="node-dialog" aria-labelledby="node-dialog-title">
+  <div class="dialog-form">
+    <div class="dialog-head">
+      <div>
+        <p class="eyebrow" id="node-dialog-where">Add a step</p>
+        <h2 class="dialog-title" id="node-dialog-title">Pick what it does</h2>
+      </div>
+      <button class="btn-icon" type="button" id="node-dialog-close" aria-label="Close">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <div id="node-dialog-body"></div>
+  </div>
+</dialog>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<script src="app.js" type="module"></script>
+
+<noscript>
+  <div class="noscript">
+    <p><strong>This page needs JavaScript.</strong> It draws itself from the local API at
+    <code>127.0.0.1:7717</code>. With scripts off there is nothing to draw.</p>
+    <p>You can still use the CLI: <code>bin/aflow list</code>, <code>bin/aflow run &lt;slug&gt;</code>.</p>
+  </div>
+</noscript>
+
+</body>
+</html>

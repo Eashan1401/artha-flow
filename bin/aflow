@@ -1,0 +1,908 @@
+#!/usr/bin/env node
+// ARTHA FLOW command line tool.
+//
+// This is the hand that Claude uses. A workflow parks on an AI node, a prompt lands in the
+// queue, Claude runs "aflow next", thinks, and runs "aflow answer". The run carries on.
+//
+// Rules this file lives by:
+//   - zero npm packages, Node built ins only
+//   - stdout is for data, stderr is for talking to a human
+//   - exit codes: 0 fine, 1 usage error, 2 server unreachable, 3 API error
+//   - project root comes from import.meta.url, never process.cwd()
+
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import fs from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
+import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
+
+// ---------------------------------------------------------------------------
+// Paths and config
+// ---------------------------------------------------------------------------
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(HERE, '..');            
+
+const EXIT_OK = 0;
+const EXIT_USAGE = 1;
+const EXIT_UNREACHABLE = 2;
+const EXIT_API = 3;
+
+const PORT = process.env.AFLOW_PORT || '7717';
+const HOST = '127.0.0.1';
+
+function readVersion() {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    return pkg.version || '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+const VERSION = readVersion();
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+function say(...args) { process.stderr.write(args.join(' ') + '\n'); }
+function out(...args) { process.stdout.write(args.join(' ') + '\n'); }
+
+// Stopping the process is done by throwing this, never by calling process.exit deep inside a
+// command. stdout to a pipe is async in Node, so an early process.exit can cut a JSON reply in
+// half. main() is the only place that ends the process, and it flushes first.
+class Exit extends Error {
+  constructor(code) { super('exit ' + code); this.code = code; }
+}
+
+function exitWith(code) {
+  process.exitCode = code;
+  process.stderr.write('', () => {
+    process.stdout.write('', () => process.exit(code));
+  });
+}
+
+function die(code, message, hint) {
+  say(message);
+  if (hint) say(hint);
+  throw new Exit(code);
+}
+
+function usageError(message) {
+  say('Usage error: ' + message);
+  say('Run "aflow help" to see every command.');
+  throw new Exit(EXIT_USAGE);
+}
+
+const HELP = `ARTHA FLOW  v${VERSION}
+Local workflow engine. The thinking is done by the AI agent you already run
+(Claude Code, Codex, or any agent with a shell), so there is no API key.
+
+Usage: aflow <command> [options]
+
+  list                          list workflows
+  run <slug> [json-input]       start a run, print the run id
+  status <runId>                one line status
+  watch <runId>                 stream events until the run ends
+  next                          print the next waiting prompt as JSON, claims it
+  pending                       list all waiting prompts
+  answer <promptId> [text]      answer, or read the answer from stdin
+  fail <promptId> <reason>      mark a prompt failed
+  serve                         start the server in the foreground
+  start | stop                  run the server in the background / stop it
+  doctor                        check Node, files, workflows and the server
+  new <slug>                    scaffold a new workflow file
+  health                        print health JSON
+  help                          this text
+
+Options that work everywhere:
+  --json            print the raw API JSON instead of a friendly table
+  --url <base>      talk to a different server (default http://127.0.0.1:${PORT})
+  --quiet           no chatter on stderr
+  --version         print the version
+
+Command options:
+  next    --no-claim        look at the next prompt without claiming it
+  answer  --force           answer a prompt even if you claimed a different one
+          --no-validate     skip the local JSON check before sending
+          --actor <name>    who is answering, for example "claude:why-analyst"
+                             (default "agent:session"), shown on the step
+  watch   --timeout <sec>   give up after this many seconds
+          --poll            skip the websocket, poll the API instead
+          --strict          exit 3 if the run ends failed or cancelled
+  status  --strict          exit 3 if the run is failed or cancelled
+
+Answering a long prompt:
+  aflow answer 12 < answer.txt
+  echo "Cold coffee sells all year." | aflow answer 12
+
+Exit codes: 0 fine, 1 usage error, 2 server unreachable, 3 API error.
+`;
+
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+
+function parseArgs(argv) {
+  const flags = Object.create(null);
+  const positional = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--') { positional.push(...argv.slice(i + 1)); break; }
+    if (a.startsWith('--')) {
+      const name = a.slice(2);
+      if (name === 'url' || name === 'timeout' || name === 'actor') {
+        const value = argv[++i];
+        if (value === undefined) usageError('--' + name + ' needs a value.');
+        flags[name] = value;
+      } else {
+        flags[name] = true;
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+  return { flags, positional };
+}
+
+const { flags, positional } = parseArgs(process.argv.slice(2));
+const QUIET = Boolean(flags.quiet);
+const BASE = String(flags.url || process.env.AFLOW_URL || `http://${HOST}:${PORT}`).replace(/\/+$/, '');
+
+function chat(...args) { if (!QUIET) say(...args); }
+
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
+
+function serverDownMessage() {
+  return [
+    'ARTHA FLOW is not running at ' + BASE + '.',
+    'Start it with:  aflow serve      (or: node ' + path.join(ROOT, 'server/index.js') + ')'
+  ].join('\n');
+}
+
+async function api(method, route, body, opts = {}) {
+  const url = BASE + route;
+  let res;
+  try {
+    res = await fetch(url, {
+      method,
+      headers: body === undefined ? {} : { 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+  } catch (err) {
+    if (opts.soft) throw new Exit(EXIT_UNREACHABLE);   // caller wants to handle this quietly
+    const code = err?.cause?.code || err?.code || '';
+    if (['ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ECONNRESET', 'UND_ERR_SOCKET'].includes(code)) {
+      die(EXIT_UNREACHABLE, serverDownMessage());
+    }
+    die(EXIT_UNREACHABLE, 'Could not reach ' + BASE + '. ' + (err?.message || 'Unknown network problem.'),
+      'Start it with:  aflow serve');
+  }
+
+  const text = await res.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch { data = null; }
+  }
+
+  if (!res.ok) {
+    const message = data?.error?.message || data?.message || text || ('HTTP ' + res.status);
+    const code = data?.error?.code ? ' [' + data.error.code + ']' : '';
+    die(EXIT_API, 'Server said no (' + res.status + ')' + code + ': ' + message);
+  }
+
+  if (text && data === null) {
+    die(EXIT_API, 'Server sent something that is not JSON: ' + text.slice(0, 200));
+  }
+  return data;
+}
+
+// Same call, but a server that is not answering gives back null instead of stopping the
+// command. Used by watch, because a local server gets restarted a lot while it is being built
+// and losing the stream over a two second restart would be annoying.
+async function apiSoft(method, route, body) {
+  try {
+    return await api(method, route, body, { soft: true });
+  } catch (err) {
+    if (err instanceof Exit && err.code === EXIT_UNREACHABLE) return null;
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Local claim state
+//
+// "aflow next" writes down which prompt it claimed. "aflow answer" checks that you are
+// answering that one. This is the guard against answering a stale prompt after a run has
+// moved on, which is the easiest mistake to make when several runs are parked at once.
+// ---------------------------------------------------------------------------
+
+const CLAIM_TTL_MS = 10 * 60 * 1000;   // matches the server side claim timeout
+
+// Kept in the temp folder, not in the repo. It is machine state, not project data, and it must
+// never end up in git. One file per server, so a test server cannot confuse the real one.
+const STATE_FILE = path.join(os.tmpdir(), 'aflow-cli-' + crypto.createHash('sha1').update(BASE).digest('hex').slice(0, 8) + '.json');
+
+function readState() {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; }
+}
+
+function writeState(state) {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n');
+  } catch {
+    // A missing state file only costs us the stale prompt warning. Never fail the command.
+  }
+}
+
+function clearClaim() {
+  const state = readState();
+  delete state.claim;
+  writeState(state);
+}
+
+function activeClaim() {
+  const claim = readState().claim;
+  if (!claim || !claim.at) return null;
+  if (Date.now() - Date.parse(claim.at) > CLAIM_TTL_MS) return null;
+  return claim;
+}
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
+
+function table(rows, headers) {
+  if (!rows.length) return '';
+  const all = [headers, ...rows].map(r => r.map(c => (c === null || c === undefined ? '' : String(c))));
+  const widths = headers.map((_, i) => Math.max(...all.map(r => r[i].length)));
+  const line = r => r.map((c, i) => c.padEnd(widths[i])).join('  ').trimEnd();
+  return [line(all[0]), line(widths.map(w => '-'.repeat(w))), ...all.slice(1).map(line)].join('\n');
+}
+
+function shortTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  return d.toTimeString().slice(0, 8);
+}
+
+function duration(a, b) {
+  if (!a) return '';
+  const start = Date.parse(a);
+  const end = b ? Date.parse(b) : Date.now();
+  if (Number.isNaN(start) || Number.isNaN(end)) return '';
+  const secs = Math.max(0, Math.round((end - start) / 1000));
+  if (secs < 60) return secs + 's';
+  return Math.floor(secs / 60) + 'm' + String(secs % 60).padStart(2, '0') + 's';
+}
+
+function oneLine(text, max = 70) {
+  const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return flat.length > max ? flat.slice(0, max - 3) + '...' : flat;
+}
+
+function printJson(value) { out(JSON.stringify(value, null, 2)); }
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+async function cmdHealth() {
+  const data = await api('GET', '/api/health');
+  printJson(data);
+}
+
+async function cmdList() {
+  const data = await api('GET', '/api/workflows');
+  if (flags.json) return printJson(data);
+  const rows = (data || []).map(w => [
+    w.slug,
+    w.name,
+    w.nodeCount ?? '',
+    w.enabled === 0 || w.enabled === false ? 'off' : 'on',
+    w.lastRun ? (w.lastRun.status || w.lastRun) : 'never',
+    oneLine(w.description, 40)
+  ]);
+  if (!rows.length) {
+    chat('No workflows loaded yet. Drop a JSON file in ' + path.join(ROOT, 'workflows') + ' and restart the server.');
+    return;
+  }
+  out(table(rows, ['SLUG', 'NAME', 'NODES', 'ON', 'LAST RUN', 'DESCRIPTION']));
+}
+
+async function cmdRun(slug, rawInput) {
+  if (!slug) usageError('run needs a workflow slug. Try: aflow run smoke-test');
+  let input;
+  if (rawInput !== undefined) {
+    try { input = JSON.parse(rawInput); } catch {
+      usageError('the input has to be valid JSON. You gave: ' + oneLine(rawInput, 60));
+    }
+  }
+  if (input === undefined) {
+    // No input given: use the example input written in the workflow file, if there is one.
+    try {
+      const file = path.join(ROOT, 'workflows', slug + '.json');
+      const def = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (def && typeof def.input === 'object') { input = def.input; chat('No input given, using the workflow\'s own example input.'); }
+    } catch { /* fall through, run with no input */ }
+  }
+  const data = await api('POST', `/api/workflows/${encodeURIComponent(slug)}/run`, { input });
+  if (flags.json) return printJson(data);
+  out(String(data.runId));
+  chat('Run ' + data.runId + ' started for "' + slug + '" (' + (data.status || 'queued') + ').');
+  chat('Watch it with:  aflow watch ' + data.runId);
+}
+
+function statusLine(run, prompts) {
+  const waiting = (prompts || []).filter(p => p.status === 'waiting' || p.status === 'claimed');
+  const tail = waiting.length
+    ? '  prompt ' + waiting.map(p => '#' + p.id).join(', ') + ' waiting'
+    : (run.error ? '  ' + oneLine(run.error, 60) : '');
+  return [
+    'run ' + run.id,
+    (run.slug || '').padEnd(14),
+    (run.status || '').padEnd(18),
+    'started ' + shortTime(run.startedAt || run.started_at),
+    duration(run.startedAt || run.started_at, run.endedAt || run.ended_at)
+  ].join('  ') + tail;
+}
+
+async function cmdStatus(runId) {
+  if (!runId) usageError('status needs a run id. Try: aflow status 1');
+  const data = await api('GET', `/api/runs/${encodeURIComponent(runId)}`);
+  if (flags.json) return printJson(data);
+  const run = data.run || data;
+  out(statusLine(run, data.prompts));
+  if (flags.strict && ['failed', 'cancelled'].includes(run.status)) throw new Exit(EXIT_API);
+}
+
+async function cmdPending() {
+  const data = await api('GET', '/api/claude/pending');
+  const list = Array.isArray(data) ? data : (data?.prompts || []);
+  if (flags.json) return printJson(data);
+  if (!list.length) {
+    chat('Nothing waiting. Every run is either finished or still working.');
+    return;
+  }
+  out(table(list.map(p => [
+    p.id,
+    p.runId ?? p.run_id,
+    p.nodeId ?? p.node_id,
+    p.expect || 'text',
+    p.status,
+    shortTime(p.createdAt || p.created_at),
+    oneLine(p.prompt, 50)
+  ]), ['ID', 'RUN', 'NODE', 'EXPECT', 'STATUS', 'CREATED', 'PROMPT']));
+  chat('');
+  chat('Claim the next one with:  aflow next');
+}
+
+async function cmdNext() {
+  const claim = flags['no-claim'] ? '' : '?claim=true';
+  const data = await api('GET', '/api/claude/next' + claim);
+  // stdout stays pure JSON so this can be piped straight into jq.
+  printJson(data);
+
+  const prompt = data?.prompt ?? (data && data.id ? data : null);
+  if (!prompt) {
+    chat('No prompt is waiting right now.');
+    return;
+  }
+  if (!flags['no-claim']) {
+    writeState({
+      ...readState(),
+      claim: {
+        promptId: prompt.id,
+        runId: prompt.runId ?? prompt.run_id ?? null,
+        nodeId: prompt.nodeId ?? prompt.node_id ?? null,
+        expect: prompt.expect || 'text',
+        at: new Date().toISOString()
+      }
+    });
+  }
+  chat('');
+  chat('Prompt ' + prompt.id + ' claimed' + (prompt.expect === 'json' ? ' (it wants JSON back)' : '') + '.');
+  chat('Answer it with:  aflow answer ' + prompt.id + ' "your answer"');
+}
+
+function readStdin() {
+  return new Promise(resolve => {
+    let buf = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', chunk => { buf += chunk; });
+    process.stdin.on('end', () => resolve(buf));
+    process.stdin.on('error', () => resolve(buf));
+  });
+}
+
+async function cmdAnswer(promptId, inlineText) {
+  if (!promptId) usageError('answer needs a prompt id. Try: aflow answer 12 "your answer"');
+  if (!/^\d+$/.test(String(promptId))) usageError('the prompt id has to be a number. You gave: ' + promptId);
+
+  let answer = inlineText;
+  if (answer === undefined) {
+    if (process.stdin.isTTY) {
+      usageError('no answer given. Pass it as an argument, or pipe it in:  aflow answer ' + promptId + ' < answer.txt');
+    }
+    answer = (await readStdin()).replace(/\n$/, '');
+  }
+  if (!String(answer).trim()) {
+    usageError('the answer is empty. Say something, or use "aflow fail ' + promptId + ' <reason>" instead.');
+  }
+
+  // Guard 1: are you answering the prompt you claimed?
+  const claim = activeClaim();
+  if (claim && String(claim.promptId) !== String(promptId) && !flags.force) {
+    say('You claimed prompt ' + claim.promptId + ', but you are answering prompt ' + promptId + '.');
+    say('Answer ' + claim.promptId + ' first, or repeat this with --force if you really mean it.');
+    throw new Exit(EXIT_USAGE);
+  }
+
+  // Guard 2: if the prompt asked for JSON, check it parses before we spend a retry on it.
+  const expectsJson = claim && String(claim.promptId) === String(promptId) && claim.expect === 'json';
+  if (expectsJson && !flags['no-validate']) {
+    try {
+      JSON.parse(answer);
+    } catch (err) {
+      say('Prompt ' + promptId + ' wants JSON and this is not valid JSON: ' + err.message);
+      say('Fix it and send again, or use --no-validate to send it anyway.');
+      throw new Exit(EXIT_USAGE);
+    }
+  }
+
+  // Who is answering. "make the agents visible", 2026-09-17: --actor names the
+  // real agent behind this answer, for example --actor "claude:why-analyst",
+  // so the run view can show who did the step instead of an unnamed process.
+  // Defaults to "agent:session" when nothing is given, same default the API
+  // and the engine fall back to on their own.
+  const actor = typeof flags.actor === 'string' && flags.actor.trim() ? flags.actor.trim() : 'agent:session';
+
+  const data = await api('POST', '/api/claude/answer', { promptId: Number(promptId), answer, actor });
+  if (claim && String(claim.promptId) === String(promptId)) clearClaim();
+  if (flags.json) return printJson(data);
+  out('answered ' + promptId + (data.runId ? '  run ' + data.runId : '') + (data.resumed ? '  resumed' : '') + '  actor ' + actor);
+  if (data.runId) chat('Check it landed with:  aflow status ' + data.runId);
+}
+
+async function cmdFail(promptId, ...reasonParts) {
+  if (!promptId) usageError('fail needs a prompt id. Try: aflow fail 12 "the prompt is missing the data"');
+  const reason = reasonParts.join(' ').trim();
+  if (!reason) usageError('fail needs a reason. Say why you cannot answer it.');
+  const data = await api('POST', '/api/claude/fail', { promptId: Number(promptId), reason });
+  const claim = activeClaim();
+  if (claim && String(claim.promptId) === String(promptId)) clearClaim();
+  if (flags.json) return printJson(data);
+  out('failed ' + promptId + ': ' + reason);
+}
+
+async function cmdServe() {
+  const entry = path.join(ROOT, 'server', 'index.js');
+  if (!fs.existsSync(entry)) {
+    die(EXIT_USAGE, 'The server file is not there yet: ' + entry);
+  }
+  chat('Starting ARTHA FLOW on http://' + HOST + ':' + PORT + '  (ctrl+c to stop)');
+  const child = spawn(process.execPath, [entry], { stdio: 'inherit', cwd: ROOT, env: process.env });
+  const stop = sig => { if (!child.killed) child.kill(sig); };
+  process.on('SIGINT', () => stop('SIGINT'));
+  process.on('SIGTERM', () => stop('SIGTERM'));
+  child.on('exit', (code, signal) => process.exit(signal ? EXIT_OK : (code ?? EXIT_OK)));
+  child.on('error', err => die(EXIT_USAGE, 'Could not start the server: ' + err.message));
+  await new Promise(() => {});   // hold the process open, the child owns the terminal now
+}
+
+
+// ---------------------------------------------------------------------------
+// Setup helpers for agents: start, stop, doctor, new
+// ---------------------------------------------------------------------------
+
+const PID_FILE = path.join(ROOT, 'data', 'server.pid');
+const LOG_FILE = path.join(ROOT, 'data', 'server.log');
+
+async function serverUp() {
+  try { const r = await fetch(BASE + '/api/health'); return r.ok; } catch { return false; }
+}
+
+async function cmdStart() {
+  if (await serverUp()) { chat('Already running at ' + BASE); return out(BASE); }
+  fs.mkdirSync(path.join(ROOT, 'data'), { recursive: true });
+  const logFd = fs.openSync(LOG_FILE, 'a');
+  const child = spawn(process.execPath, [path.join(ROOT, 'server', 'index.js')], {
+    cwd: ROOT, env: process.env, detached: true, stdio: ['ignore', logFd, logFd]
+  });
+  child.unref();
+  fs.writeFileSync(PID_FILE, String(child.pid));
+  for (let i = 0; i < 40; i++) {
+    if (await serverUp()) { chat('Started in the background (pid ' + child.pid + '). Log: ' + LOG_FILE); return out(BASE); }
+    await new Promise(r => setTimeout(r, 250));
+  }
+  die(EXIT_UNREACHABLE, 'The server did not come up. Read ' + LOG_FILE);
+}
+
+async function cmdStop() {
+  if (!fs.existsSync(PID_FILE)) { chat('No pid file, nothing to stop.'); return; }
+  const pid = Number(fs.readFileSync(PID_FILE, 'utf8'));
+  try { process.kill(pid, 'SIGTERM'); chat('Stopped pid ' + pid); } catch { chat('That process was already gone.'); }
+  fs.rmSync(PID_FILE, { force: true });
+}
+
+async function cmdDoctor() {
+  const checks = [];
+  const [maj, min] = process.versions.node.split('.').map(Number);
+  checks.push(['Node 22.5 or newer', maj > 22 || (maj === 22 && min >= 5), 'found ' + process.versions.node + (maj < 22 ? '. Install Node 22.5+ from nodejs.org' : '')]);
+  let sqlite = true;
+  try { await import('node:sqlite'); } catch { sqlite = false; }
+  checks.push(['node:sqlite available', sqlite, 'needs Node 22.5+ (on 22.x run node with --experimental-sqlite if it complains)']);
+  checks.push(['server files present', fs.existsSync(path.join(ROOT, 'server', 'index.js')), 'the clone looks incomplete']);
+  const wfDir = path.join(ROOT, 'workflows');
+  const wfs = fs.existsSync(wfDir) ? fs.readdirSync(wfDir).filter(f => f.endsWith('.json')) : [];
+  checks.push(['at least one workflow', wfs.length > 0, 'run: aflow new my-first-flow']);
+  for (const f of wfs) {
+    let ok = true, why = '';
+    try { const w = JSON.parse(fs.readFileSync(path.join(wfDir, f), 'utf8')); if (!w.slug || !Array.isArray(w.nodes)) { ok = false; why = 'missing slug or nodes'; } }
+    catch (e) { ok = false; why = e.message; }
+    checks.push(['workflow ' + f + ' is valid JSON', ok, why]);
+  }
+  checks.push(['server reachable at ' + BASE, await serverUp(), 'run: aflow start']);
+  let bad = 0;
+  for (const [name, ok, hint] of checks) { out((ok ? 'ok    ' : 'FAIL  ') + name + (ok ? '' : '   -> ' + hint)); if (!ok) bad++; }
+  if (bad) throw new Exit(EXIT_USAGE);
+}
+
+async function cmdNew(slug) {
+  if (!slug || !/^[a-z0-9][a-z0-9-]*$/.test(slug)) usageError('new needs a slug of lowercase letters, numbers and dashes. Try: aflow new weekly-report');
+  const file = path.join(ROOT, 'workflows', slug + '.json');
+  if (fs.existsSync(file)) die(EXIT_USAGE, file + ' already exists.');
+  const wf = {
+    slug, name: slug, description: 'Describe what this workflow is for.',
+    trigger: { type: 'manual' }, input: { topic: 'example' },
+    nodes: [
+      { id: 'n1', type: 'log', name: 'Start', config: { message: 'Run {{ run.id }} on {{ input.topic }}', level: 'info' }, next: 'n2' },
+      { id: 'n2', type: 'claude', name: 'Think', config: { system: 'Plain English. Answer only.', prompt: 'Write one useful sentence about {{ input.topic }}.', expect: 'text' }, next: 'n3' },
+      { id: 'n3', type: 'write', name: 'Save', config: { path: slug + '/{{ run.id }}.txt', content: '{{ steps.n2.output.text }}', mode: 'overwrite', format: 'text' }, next: null }
+    ]
+  };
+  fs.writeFileSync(file, JSON.stringify(wf, null, 2) + '\n');
+  chat('Created ' + file);
+  chat('Workflows load when the server starts: run  aflow stop && aflow start  then  aflow run ' + slug);
+  out(file);
+}
+
+// ---------------------------------------------------------------------------
+// Websocket client, hand rolled on node:net and node:crypto
+//
+// Only what we need: an RFC 6455 client that does the handshake, reads text frames from the
+// server (servers never mask), writes masked text frames (clients always mask), answers
+// pings, and joins continuation frames. Anything odd closes the socket and we fall back to
+// polling, which is why this can stay small.
+// ---------------------------------------------------------------------------
+
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+function wsConnect(baseUrl, { onMessage, onOpen, onClose }) {
+  const url = new URL(baseUrl);
+  const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+  const key = crypto.randomBytes(16).toString('base64');
+  const accept = crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
+
+  const socket = net.connect({ host: url.hostname, port });
+  let handshakeDone = false;
+  let buffer = Buffer.alloc(0);
+  let fragOpcode = 0;
+  let fragChunks = [];
+  let closed = false;
+
+  const finish = reason => {
+    if (closed) return;
+    closed = true;
+    socket.destroy();
+    onClose(reason);
+  };
+
+  socket.on('error', err => finish('socket error: ' + err.message));
+  socket.on('close', () => finish('socket closed'));
+
+  socket.on('connect', () => {
+    socket.write(
+      'GET /ws HTTP/1.1\r\n' +
+      'Host: ' + url.hostname + ':' + port + '\r\n' +
+      'Upgrade: websocket\r\n' +
+      'Connection: Upgrade\r\n' +
+      'Sec-WebSocket-Key: ' + key + '\r\n' +
+      'Sec-WebSocket-Version: 13\r\n' +
+      '\r\n'
+    );
+  });
+
+  socket.on('data', chunk => {
+    buffer = Buffer.concat([buffer, chunk]);
+
+    if (!handshakeDone) {
+      const end = buffer.indexOf('\r\n\r\n');
+      if (end === -1) return;
+      const head = buffer.slice(0, end).toString('utf8');
+      buffer = buffer.slice(end + 4);
+      if (!/^HTTP\/1\.1 101/i.test(head)) {
+        return finish('server refused the upgrade: ' + head.split('\r\n')[0]);
+      }
+      const got = /sec-websocket-accept:\s*(\S+)/i.exec(head);
+      if (!got || got[1] !== accept) return finish('bad websocket accept key');
+      handshakeDone = true;
+      onOpen();
+    }
+
+    // Frame reader.
+    for (;;) {
+      if (buffer.length < 2) return;
+      const first = buffer[0];
+      const second = buffer[1];
+      const fin = (first & 0x80) !== 0;
+      const opcode = first & 0x0f;
+      const masked = (second & 0x80) !== 0;
+      let len = second & 0x7f;
+      let offset = 2;
+
+      if (len === 126) {
+        if (buffer.length < offset + 2) return;
+        len = buffer.readUInt16BE(offset); offset += 2;
+      } else if (len === 127) {
+        if (buffer.length < offset + 8) return;
+        const big = buffer.readBigUInt64BE(offset); offset += 8;
+        if (big > 64n * 1024n * 1024n) return finish('frame too big');
+        len = Number(big);
+      }
+
+      let mask = null;
+      if (masked) {                       // a compliant server never masks, but be safe
+        if (buffer.length < offset + 4) return;
+        mask = buffer.slice(offset, offset + 4); offset += 4;
+      }
+      if (buffer.length < offset + len) return;
+
+      let payload = buffer.slice(offset, offset + len);
+      buffer = buffer.slice(offset + len);
+      if (mask) {
+        payload = Buffer.from(payload);
+        for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+      }
+
+      if (opcode === 0x8) { socket.write(encodeFrame(0x8, Buffer.alloc(0))); return finish('server closed the stream'); }
+      if (opcode === 0x9) { socket.write(encodeFrame(0xa, payload)); continue; }
+      if (opcode === 0xa) { continue; }
+
+      if (opcode === 0x0) {               // continuation of a fragmented message
+        fragChunks.push(payload);
+        if (!fin) continue;
+        const whole = Buffer.concat(fragChunks);
+        fragChunks = []; const op = fragOpcode; fragOpcode = 0;
+        if (op === 0x1) onMessage(whole.toString('utf8'));
+        continue;
+      }
+      if (!fin) { fragOpcode = opcode; fragChunks = [payload]; continue; }
+      if (opcode === 0x1) onMessage(payload.toString('utf8'));
+    }
+  });
+
+  return {
+    send(text) {
+      if (handshakeDone && !closed) socket.write(encodeFrame(0x1, Buffer.from(text, 'utf8'), true));
+    },
+    close() { finish('closed by us'); }
+  };
+}
+
+function encodeFrame(opcode, payload, mask = false) {
+  const len = payload.length;
+  let header;
+  if (len < 126) header = Buffer.from([0x80 | opcode, (mask ? 0x80 : 0) | len]);
+  else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode; header[1] = (mask ? 0x80 : 0) | 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | opcode; header[1] = (mask ? 0x80 : 0) | 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  if (!mask) return Buffer.concat([header, payload]);
+  const key = crypto.randomBytes(4);
+  const body = Buffer.from(payload);
+  for (let i = 0; i < body.length; i++) body[i] ^= key[i % 4];
+  return Buffer.concat([header, key, body]);
+}
+
+// ---------------------------------------------------------------------------
+// watch
+// ---------------------------------------------------------------------------
+
+const ENDED = new Set(['done', 'failed', 'cancelled']);
+
+// Two shapes arrive here and both have to look the same on screen:
+//   live over the websocket, which is a flat { type, runId, ...payload }
+//   read back from the API, which is a stored row { ts, level, message, data } with the real
+//   event type inside data
+function formatEvent(raw) {
+  const inner = raw && typeof raw.data === 'object' && raw.data ? raw.data : {};
+  const ev = { ...raw, ...inner };
+  const isEventName = s => typeof s === 'string' && /^[a-z]+\.[a-z]+$/.test(s);
+  const type = ev.type || (isEventName(raw.message) ? raw.message : 'log');
+
+  const bits = [];
+  if (type === 'run.started' && ev.slug) bits.push(ev.slug);
+  if (ev.nodeId || ev.node_id) bits.push(ev.nodeId || ev.node_id);
+  if (ev.nodeType) bits.push(ev.nodeType);
+  if (ev.name) bits.push('"' + ev.name + '"');
+  if (type === 'log' && ev.level) bits.push(ev.level);
+  if (ev.message && ev.message !== type) bits.push(oneLine(ev.message, 90));
+  if (ev.status) bits.push(ev.status);
+  if (ev.promptId) bits.push('prompt #' + ev.promptId);
+  if (ev.error) bits.push('error: ' + oneLine(String(ev.error?.message || ev.error), 90));
+  if (ev.iteration !== undefined && ev.iteration !== null) bits.push('[' + ev.iteration + ']');
+
+  const when = shortTime(raw.ts || raw.at || new Date().toISOString());
+  return when + '  ' + String(type).padEnd(15) + '  ' + bits.join('  ');
+}
+
+async function cmdWatch(runId) {
+  if (!runId) usageError('watch needs a run id. Try: aflow watch 1');
+  const timeoutSec = flags.timeout ? Number(flags.timeout) : 0;
+  if (flags.timeout && (!Number.isFinite(timeoutSec) || timeoutSec <= 0)) {
+    usageError('--timeout wants a number of seconds.');
+  }
+
+  // Read the run once first, so we print the history and catch a run that already ended.
+  const first = await api('GET', `/api/runs/${encodeURIComponent(runId)}`);
+  const run = first.run || first;
+  const seen = { lastEventId: 0 };
+  for (const ev of first.events || []) {
+    if (!flags.json) out(formatEvent(ev)); else printJson(ev);
+    if (ev.id > seen.lastEventId) seen.lastEventId = ev.id;
+  }
+  if (ENDED.has(run.status)) return endWatch(run);
+
+  const deadline = timeoutSec ? Date.now() + timeoutSec * 1000 : 0;
+
+  if (!flags.poll) {
+    const res = await watchOverSocket(runId, deadline, seen);
+    if (res && 'run' in res) return endWatch(res.run);
+    chat(res && res.opened
+      ? 'The websocket dropped. Switching to polling.'
+      : 'Websocket did not work, falling back to polling.');
+  }
+  const viaPoll = await watchByPolling(runId, seen.lastEventId, deadline);
+  return endWatch(viaPoll);
+}
+
+function endWatch(run) {
+  if (!run) {
+    chat('Stopped watching: the timeout ran out.');
+    return;
+  }
+  chat('');
+  chat('Run ' + run.id + ' ended: ' + run.status + (run.error ? '  ' + oneLine(run.error, 90) : ''));
+  if (flags.strict && ENDED.has(run.status) && run.status !== 'done') throw new Exit(EXIT_API);
+}
+
+function watchOverSocket(runId, deadline, seen) {
+  return new Promise(resolve => {
+    let settled = false;
+    let opened = false;
+    let timer = null;
+    const done = value => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try { ws.close(); } catch { /* already gone */ }
+      resolve(value);
+    };
+
+    const ws = wsConnect(BASE, {
+      onOpen() {
+        opened = true;
+        chat('Live over the websocket. Ctrl+c to stop.');
+        ws.send(JSON.stringify({ type: 'subscribe', runId: Number(runId) }));
+      },
+      onMessage(text) {
+        let msg;
+        try { msg = JSON.parse(text); } catch { return; }
+        if (msg.type === 'hello') return;
+        if (msg.runId !== undefined && String(msg.runId) !== String(runId)) return;
+        if (msg.id && msg.id > seen.lastEventId) seen.lastEventId = msg.id;
+        if (flags.json) printJson(msg); else out(formatEvent(msg));
+        if (msg.type === 'run.waiting') {
+          chat('  -> parked on Claude. Answer it:  aflow next');
+        }
+        if (['run.finished', 'run.failed', 'run.cancelled'].includes(msg.type)) {
+          api('GET', `/api/runs/${encodeURIComponent(runId)}`).then(d => done({ run: d.run || d }));
+        }
+      },
+      onClose() {
+        // Socket gone. The caller falls back to polling either way, and "opened" only changes
+        // the wording, so a dropped stream does not look like a broken server.
+        if (!settled) { settled = true; if (timer) clearTimeout(timer); resolve({ opened }); }
+      }
+    });
+
+    if (deadline) timer = setTimeout(() => done({ run: null }), Math.max(0, deadline - Date.now()));
+  });
+}
+
+const GONE_LIMIT = 15;   // roughly 30 seconds of a dead server before we give up
+
+async function watchByPolling(runId, lastEventId, deadline) {
+  let parkedSaid = false;
+  let gone = 0;
+  for (;;) {
+    const data = await apiSoft('GET', `/api/runs/${encodeURIComponent(runId)}`);
+    if (!data) {
+      // The server went away. It is probably being restarted, so wait for it rather than
+      // throwing away the stream.
+      if (++gone === 1) chat('Server stopped answering. Waiting for it to come back.');
+      if (gone > GONE_LIMIT) die(EXIT_UNREACHABLE, serverDownMessage());
+      await new Promise(r => setTimeout(r, 2000));
+      continue;
+    }
+    if (gone) { chat('Server is back.'); gone = 0; }
+    const run = data.run || data;
+    for (const ev of data.events || []) {
+      if (ev.id && ev.id <= lastEventId) continue;
+      if (flags.json) printJson(ev); else out(formatEvent(ev));
+      if (ev.id > lastEventId) lastEventId = ev.id;
+    }
+    if (ENDED.has(run.status)) return run;
+    if (run.status === 'waiting_on_claude' && !parkedSaid) {
+      const p = (data.prompts || []).find(x => x.status === 'waiting' || x.status === 'claimed');
+      if (p) { chat('  -> parked on prompt #' + p.id + '. Answer it:  aflow next'); parkedSaid = true; }
+    }
+    if (run.status !== 'waiting_on_claude') parkedSaid = false;
+    if (deadline && Date.now() >= deadline) return null;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+async function main() {
+  if (flags.version) { out(VERSION); return; }
+  const [command, ...rest] = positional;
+  if (!command || flags.help || command === 'help' || command === '--help') {
+    process.stdout.write(HELP);
+    throw new Exit(command || flags.help ? EXIT_OK : EXIT_USAGE);
+  }
+
+  switch (command) {
+    case 'list':    return cmdList();
+    case 'run':     return cmdRun(rest[0], rest[1]);
+    case 'status':  return cmdStatus(rest[0]);
+    case 'watch':   return cmdWatch(rest[0]);
+    case 'next':    return cmdNext();
+    case 'pending': return cmdPending();
+    case 'answer':  return cmdAnswer(rest[0], rest.length > 1 ? rest.slice(1).join(' ') : undefined);
+    case 'fail':    return cmdFail(rest[0], ...rest.slice(1));
+    case 'serve':   return cmdServe();
+    case 'health':  return cmdHealth();
+    case 'start':   return cmdStart();
+    case 'stop':    return cmdStop();
+    case 'doctor':  return cmdDoctor();
+    case 'new':     return cmdNew(rest[0]);
+    default:
+      usageError('there is no command called "' + command + '".');
+  }
+}
+
+process.on('SIGINT', () => { say(''); say('Stopped.'); exitWith(EXIT_OK); });
+
+main().then(
+  () => exitWith(EXIT_OK),
+  err => {
+    if (err instanceof Exit) return exitWith(err.code);
+    say('Something broke inside aflow: ' + (err?.stack || err?.message || String(err)));
+    exitWith(EXIT_API);
+  }
+);

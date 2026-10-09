@@ -1,0 +1,265 @@
+/* ============================================================================
+   ARTHA FLOW, design tokens.
+
+   style.css is not allowed to hold a raw hex colour. Every colour it uses
+   comes from a var() defined here.
+
+   Two additions past the OS list, both explained where they are defined:
+   --label-timer, because FLOW has a state the OS does not (parked on a
+   timer, not on a person), and the --st-* aliases, because FLOW's own CSS
+   already used these names everywhere and renaming every call site was a
+   bigger diff for no reason. The alias is the seam, not a second palette.
+   ========================================================================= */
+
+:root {
+  color-scheme: dark;
+
+  /* -- Base. Black HD. Pasted verbatim from the OS. -- */
+  --void:        #000000;
+  --base:        #000000;
+  --surface-0:   #0A0A0B;
+  --surface-1:   #101011;
+  --surface-2:   #17181A;
+  --surface-3:   #202124;
+
+  /* -- Ink. Warm off white through to a ghost grey. Neutral, never blue. -- */
+  --ink:         #EDEBE6;
+  --ink-strong:  #FFFFFF;
+  --ink-muted:   #A5A39D;
+  --ink-faint:   #76746F;
+  --ink-ghost:   #4B4A47;
+
+  /* -- Hairlines. -- */
+  --line:        rgba(255, 255, 255, 0.10);
+  --line-soft:   rgba(255, 255, 255, 0.06);
+  --line-strong: rgba(255, 255, 255, 0.18);
+
+  /* -- Ambient pools behind the glass. White, nearly invisible on purpose. -- */
+  --pool-a:      rgba(255, 255, 255, 0.055);
+  --pool-b:      rgba(255, 255, 255, 0.032);
+  --pool-c:      rgba(255, 255, 255, 0.026);
+
+  /* -- FLOW's own accent, for chrome. Neutral, like the OS's --artha. -- */
+  --accent:      #D9D6CF;
+  --accent-dim:  rgba(217, 214, 207, 0.10);
+  --accent-soft: #FBF8F2;
+  --accent-line: rgba(233, 229, 220, 0.18);
+  --accent-glow: rgba(233, 229, 220, 0.22);
+  --accent-ink:  #0B0B0C;
+
+  /* -- Status, monochrome. Same inverted ladder as the OS: attention is
+        brightness, not hue. fail = brightest, because it is what needs a
+        look. pass = quiet, because good news does not need you. -- */
+  --pass:       #8A8F96;
+  --pass-dim:   rgba(255, 255, 255, 0.05);
+  --warn:       #C8C5BE;
+  --warn-dim:   rgba(255, 255, 255, 0.07);
+  --fail:       #FFFFFF;
+  --fail-dim:   rgba(255, 255, 255, 0.10);
+  --info:       #A8A6A1;
+  --info-dim:   rgba(255, 255, 255, 0.06);
+
+  /* -- The label pills. Same four the OS keeps as its one splash of hue,
+        heavily desaturated, pill background always the same neutral wash so
+        only the dot and the word carry any colour at all.
+
+        Plus one FLOW only addition: --label-timer. The OS has nothing that
+        waits on a clock instead of a person, FLOW does (a `wait` node), and
+        that is a real distinction worth keeping visible: a person is not
+        needed for a timer to resolve. Built to the same recipe as the other
+        three (a name colour, muted a long way below UI saturation), not
+        picked freehand. -- */
+  --label-measured:    #79B994;
+  --label-client:      #8FAAC9;
+  --label-estimated:   #CBA76A;
+  --label-notmeasured: #76746F;
+  --label-timer:       #A79BC9;
+  --label-ground:      rgba(255, 255, 255, 0.06);
+
+  /* RGB triplets of the same colours, for the rare spot that needs a
+     specific alpha CSS cannot get from a hex plus opacity alone (a border at
+     one alpha, a wash at another). Every rgba() in this UI that is not
+     already one of the *-dim tokens above builds from one of these, so the
+     number is still traceable to a named token, never typed freehand. */
+  --fail-rgb:              255, 255, 255;
+  --label-estimated-rgb:   203, 167, 106;
+  --label-timer-rgb:       167, 155, 201;
+  --label-measured-rgb:    121, 185, 148;
+  --label-client-rgb:      143, 170, 201;
+
+  /* -- Status aliases. FLOW's CSS was already written against --st-* names
+        throughout; this is the seam that points every one of those calls at
+        the tokens above instead of at a hardcoded hex.
+
+        running   -> informational, quiet blue-grey, same family as the OS's
+                     "client" label.
+        done      -> quiet, good news, same family as the OS's "measured".
+        failed    -> brightest thing on the page. A failed run needs a look
+                     as much as a parked one does. See think-ahead's rule 2.
+        waiting_on_claude -> parked on a person. Gold on its own status pill,
+                     but its real weight comes from the needs-you banner
+                     (position and size), not from a louder colour here. Two
+                     screens shouting the same thing does not read as more
+                     urgent, it reads as noisy.
+        waiting_on_timer  -> parked on a clock, resolves itself. Its own
+                     desaturated hue, quieter than waiting_on_claude, because
+                     nobody has to act on it.
+        queued / cancelled -> quiet, ink family, nothing to look at. -- */
+  --st-running:   var(--label-client);
+  --st-done:      var(--label-measured);
+  --st-failed:    var(--fail);
+  --st-waiting:   var(--label-estimated);
+  --st-timer:     var(--label-timer);
+  --st-queued:    var(--ink-faint);
+  --st-cancelled: var(--ink-ghost);
+
+  /* Every status pill shares the OS's neutral pill ground. Only the dot and
+     the word carry colour. */
+  --st-running-dim:   var(--label-ground);
+  --st-done-dim:      var(--label-ground);
+  --st-failed-dim:    var(--fail-dim);
+  --st-waiting-dim:   var(--label-ground);
+  --st-timer-dim:     var(--label-ground);
+  --st-queued-dim:    var(--label-ground);
+  --st-cancelled-dim: var(--label-ground);
+
+  /* -- Type. Pasted from the OS, including the 2026-08-19 hero bump: the
+        room is the default now, nobody has to remember to ask for it. -- */
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+          "Inter", "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, monospace;
+
+  --t-hero:   clamp(2rem, 3.2vw, 3rem);
+  --t-h1:     clamp(1.5rem, 2vw, 1.9rem);
+  --t-h2:     1.1875rem;
+  --t-h3:     1rem;
+  --t-body:   0.9375rem;
+  --t-small:  0.875rem;
+  --t-micro:  0.75rem;
+
+  --w-regular: 400;
+  --w-medium:  500;
+  --w-semi:    590;
+  --w-bold:    680;
+
+  --track-hero:  -0.022em;
+  --track-h1:    -0.018em;
+  --track-body:  -0.005em;
+  --track-micro:  0.07em;
+
+  --lh-tight: 1.15;
+  --lh-body:  1.5;
+  --lh-loose: 1.6;
+
+  /* -- Space. 4px base, same scale FLOW already used. -- */
+  --s-1: 4px;   --s-2: 8px;   --s-3: 12px;  --s-4: 16px;
+  --s-5: 20px;  --s-6: 24px;  --s-8: 32px;  --s-10: 40px;
+  --s-12: 48px; --s-16: 64px;
+
+  /* -- Radius. -- */
+  --r-xs: 6px;  --r-sm: 10px; --r-md: 14px;
+  --r-lg: 20px; --r-xl: 28px; --r-pill: 999px;
+
+  /* -- Glass recipe, pasted verbatim. -- */
+  --glass-tint:      rgba(255, 255, 255, 0.042);
+  --glass-tint-up:   rgba(255, 255, 255, 0.07);
+  --glass-blur:      saturate(170%) blur(28px);
+  --glass-blur-deep: saturate(190%) blur(48px);
+
+  --glass-specular: linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.14) 0%,
+      rgba(255, 255, 255, 0.03) 20%,
+      rgba(255, 255, 255, 0) 52%);
+
+  --glass-edge:
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.13),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.065),
+      0 1px 2px rgba(0, 0, 0, 0.5),
+      0 12px 32px -8px rgba(0, 0, 0, 0.65);
+
+  --glass-edge-raised:
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.14),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.07),
+      0 2px 4px rgba(0, 0, 0, 0.55),
+      0 24px 60px -12px rgba(0, 0, 0, 0.75);
+
+  --sh-1: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --sh-2: 0 4px 12px -2px rgba(0, 0, 0, 0.55);
+  --sh-3: 0 16px 40px -8px rgba(0, 0, 0, 0.7);
+
+  /* -- Motion. Apple springs, and it is quick. -- */
+  --e-out:    cubic-bezier(0.22, 1, 0.36, 1);
+  --e-inout:  cubic-bezier(0.65, 0, 0.35, 1);
+  --e-spring: cubic-bezier(0.34, 1.4, 0.64, 1);
+  --d-fast:   140ms;
+  --d-base:   220ms;
+  --d-slow:   380ms;
+
+  --topbar-h: 52px;
+  --z-base: 0; --z-raised: 10; --z-sticky: 100;
+  --z-nav: 200; --z-popover: 300; --z-modal: 400; --z-toast: 500;
+}
+
+/* ============================================================================
+   Glass utilities, pasted from the OS. Use these, do not re-invent the
+   recipe per panel.
+   ========================================================================= */
+
+.glass,
+.glass-raised {
+  position: relative;
+  background: var(--glass-tint);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border-radius: var(--r-lg);
+  box-shadow: var(--glass-edge);
+}
+
+.glass-raised {
+  background: var(--glass-tint-up);
+  -webkit-backdrop-filter: var(--glass-blur-deep);
+  backdrop-filter: var(--glass-blur-deep);
+  box-shadow: var(--glass-edge-raised);
+}
+
+.glass::before,
+.glass-raised::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--glass-specular);
+  pointer-events: none;
+}
+
+.glass > *,
+.glass-raised > * { position: relative; }
+
+@media (prefers-reduced-transparency: reduce) {
+  .glass,
+  .glass-raised {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    background: var(--surface-2);
+    box-shadow: inset 0 0 0 1px var(--line), var(--sh-2);
+  }
+  .glass::before,
+  .glass-raised::before { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (update: slow) {
+  .glass, .glass-raised {
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+  }
+}

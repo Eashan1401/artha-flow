@@ -1,0 +1,670 @@
+/* ============================================================================
+   ARTHA FLOW, the canvas.
+
+   B2 owns this file and graph-canvas.js only. House tokens come from
+   ui/style.css (--bg, --panel, --line, --ink, --muted, --st-*, --mono, --font,
+   --r-md, and so on). Every variable here has a fallback so this file still
+   renders something sane if it is ever opened on its own, in a standalone test
+   page, or before style.css has loaded.
+
+   One rule drives the whole file: pan and zoom touch exactly one transform on
+   one wrapper element. Nothing here should need a rule that gets rewritten on
+   every node during a mouse move. Node cards get their look from a handful of
+   data attributes (tier, run state, current, selected) so painting a run is a
+   matter of flipping attributes, not rebuilding markup.
+   ========================================================================= */
+
+.gcanvas {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 320px;
+  overflow: hidden;
+  background: var(--bg);
+  background-image:
+    radial-gradient(circle, rgba(255, 255, 255, 0.09) 1px, transparent 1.4px);
+  background-size: 26px 26px;
+  background-position: 0 0;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  border-radius: var(--r-lg, 16px);
+  border: 1px solid var(--line);
+}
+.gcanvas[data-panning="1"],
+.gcanvas[data-space="1"] { cursor: grabbing; }
+.gcanvas[data-dragging="1"] { cursor: default; }
+.gcanvas:focus { outline: none; }
+.gcanvas:focus-visible {
+  outline: 2px solid var(--st-running);
+  outline-offset: -2px;
+}
+
+/* The single transformed wrapper. Pan and zoom write ONE style here and
+   nothing else, every frame. */
+.gcanvas-viewport {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.gcanvas-lanes,
+.gcanvas-edges,
+.gcanvas-nodes {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+
+.gcanvas-edges {
+  overflow: visible;
+  pointer-events: none;
+}
+.gcanvas-edges .gc-edge-hit { pointer-events: stroke; cursor: pointer; }
+
+/* The node layer div spans the whole canvas so cards can be absolutely
+   positioned inside it, but that means its EMPTY space, everywhere that is
+   not actually a card, would otherwise sit on top of the edge layer and eat
+   every hover and click meant for an edge or its add-after button. A plain
+   div is a hit target across its full box even where nothing is drawn, so
+   this is not optional: the layer lets events pass through, and each card
+   opts back in. Found by trying to hover a real edge in a browser, not by
+   reading the DOM order and assuming it would work. */
+.gcanvas-nodes { pointer-events: none; }
+.gcanvas-nodes .gc-node { pointer-events: auto; }
+
+/* ----------------------------------------------------------------------------
+   Lanes. An each loop's body sits inside one of these, so it visually reads
+   as "everything in this box runs once per item".
+   -------------------------------------------------------------------------- */
+
+.gc-lane {
+  position: absolute;
+  border: 1.5px dashed rgba(139, 92, 246, 0.4);
+  border-radius: var(--r-lg, 16px);
+  background: rgba(139, 92, 246, 0.045);
+  pointer-events: none;
+}
+.gc-lane-label {
+  position: absolute;
+  left: 14px;
+  top: -11px;
+  padding: 2px 9px;
+  border-radius: var(--r-pill, 999px);
+  background: rgba(var(--label-timer-rgb), 0.14);
+  border: 1px solid rgba(139, 92, 246, 0.45);
+  color: var(--label-timer);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+/* ----------------------------------------------------------------------------
+   Edges
+   -------------------------------------------------------------------------- */
+
+.gc-edge {
+  fill: none;
+  stroke: var(--line-strong);
+  stroke-width: 1.6;
+  transition: stroke 160ms ease, stroke-width 160ms ease;
+}
+.gc-edge[data-kind="else"] { stroke-dasharray: 5 4; }
+.gc-edge[data-kind="back"] { stroke-dasharray: 2 3; opacity: 0.7; }
+.gc-edge[data-lit="1"] { stroke-width: 2.4; }
+.gc-edge[data-lit="1"][data-lit-tone="done"] { stroke: var(--st-done); }
+.gc-edge[data-lit="1"][data-lit-tone="failed"] { stroke: var(--st-failed); }
+.gc-edge[data-lit="1"][data-lit-tone="running"] { stroke: var(--st-running); }
+.gc-edge[data-lit="1"][data-lit-tone="parked"] { stroke: var(--st-waiting); }
+
+.gc-edge-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 18;
+}
+
+.gc-edge-label {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  fill: var(--muted);
+}
+.gc-edge-label-bg {
+  fill: var(--bg);
+  opacity: 0.92;
+}
+.gc-edge[data-kind="true"] ~ .gc-edge-label-group .gc-edge-label,
+g[data-kind="true"] .gc-edge-label { fill: var(--label-measured); }
+g[data-kind="else"] .gc-edge-label { fill: var(--label-estimated); }
+g[data-kind="body"] .gc-edge-label { fill: var(--label-timer); }
+
+.gc-add-btn {
+  opacity: 0;
+  cursor: pointer;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+.gc-add-btn circle {
+  fill: var(--panel);
+  stroke: var(--muted);
+  stroke-width: 1.3;
+}
+.gc-add-btn path { stroke: var(--ink); stroke-width: 1.6; stroke-linecap: round; }
+.gc-add-btn.is-hot,
+g[data-edge-hover="1"] .gc-add-btn {
+  opacity: 1;
+  pointer-events: all;
+}
+.gc-add-btn:hover circle { stroke: var(--st-running); fill: rgba(var(--label-client-rgb), 0.16); }
+
+/* ----------------------------------------------------------------------------
+   Ports. A wire starts and ends AT one of these, never at a bare card
+   corner. Nudged a pixel past the card's own border in graph-canvas.js so
+   the dot is never half hidden under the card's background.
+   -------------------------------------------------------------------------- */
+
+.gc-port {
+  fill: var(--line);
+  stroke: var(--muted);
+  stroke-width: 1.2;
+  pointer-events: none;
+}
+.gc-port-out[data-tier="prompt"] { fill: var(--st-waiting); stroke: var(--label-estimated); }
+.gc-port-out[data-tier="gate"] { fill: var(--label-timer); stroke: rgba(var(--label-timer-rgb), 0.7); }
+.gc-port-out[data-tier="loop"] { fill: var(--label-timer); stroke: rgba(var(--label-timer-rgb), 0.7); }
+.gc-port-out[data-tier="sub"] { fill: var(--label-client); stroke: rgba(var(--label-client-rgb), 0.7); }
+
+/* ----------------------------------------------------------------------------
+   Node cards
+   -------------------------------------------------------------------------- */
+
+.gc-node {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 12px);
+  background: var(--panel);
+  color: var(--ink);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+  cursor: pointer;
+  transition: border-color 120ms ease, box-shadow 160ms ease, opacity 160ms ease;
+}
+.gc-node:hover { border-color: var(--line-strong); }
+.gc-node[data-selected="1"] {
+  border-color: var(--st-running);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.28);
+}
+
+.gc-node-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.gc-badge {
+  flex: 0 0 auto;
+  width: 19px;
+  height: 19px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--muted);
+}
+.gc-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gc-id {
+  flex: 0 0 auto;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 9px;
+  color: var(--faint);
+  max-width: 46px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* "make the agents visible", 2026-09-17: the desk name and the role card,
+   a second line under the node's name, so a glance at the graph says who
+   this step is for, not just what it does. */
+.gc-agent-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  margin-top: 2px;
+}
+.gc-desk {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 10px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gc-role {
+  flex: 0 0 auto;
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--accent, var(--ink));
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 5px;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* "skills on the desks", 2026-09-17: which .agents/skills/ skill this desk
+   runs, a third line under desk/role, same chip shape as .gc-role so it
+   reads as a sibling fact, not a different kind of thing. */
+.gc-skills-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+  margin-top: 2px;
+}
+.gc-skill {
+  flex: 0 0 auto;
+  font-size: 9px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px dashed var(--line);
+  border-radius: 4px;
+  padding: 1px 5px;
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gc-detail {
+  font-size: 10.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Unknown node type: dashed border, badge reads "?" and nothing more is
+   assumed about it. Adding a node type must never break this canvas. */
+.gc-node[data-unknown="1"] { border-style: dashed; }
+
+/* --- tier: prompt. The loudest thing on the canvas, on purpose. ----------- */
+
+.gc-node[data-tier="prompt"] {
+  border-left: 3px solid var(--st-waiting);
+  background:
+    linear-gradient(180deg, rgba(245, 158, 11, 0.09), rgba(245, 158, 11, 0.02)),
+    var(--panel);
+  padding-left: 10px;
+}
+.gc-node[data-tier="prompt"]:hover { border-left-color: var(--label-estimated); }
+.gc-node[data-tier="prompt"] .gc-badge {
+  border-color: rgba(245, 158, 11, 0.45);
+  color: var(--st-waiting);
+}
+.gc-prompt-text {
+  margin: 0;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--ink);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+.gc-prompt-empty {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--faint);
+  font-style: italic;
+}
+.gc-sys-chip {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: var(--r-pill, 999px);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--label-estimated);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* --- tier: gate. A filter, marked with a diamond so it reads as a fork. --- */
+
+.gc-node[data-tier="gate"] {
+  border-color: rgba(139, 92, 246, 0.34);
+}
+.gc-node[data-tier="gate"]:hover { border-color: rgba(139, 92, 246, 0.55); }
+.gc-node[data-tier="gate"] .gc-badge {
+  border-color: rgba(139, 92, 246, 0.4);
+  color: var(--label-timer);
+}
+/* A small diamond sitting on the top edge, the clearest branch marker that
+   still holds up at 0.6x zoom, where a subtle notch in the card outline
+   would disappear. */
+.gc-node[data-tier="gate"]::after {
+  content: "";
+  position: absolute;
+  top: -6px;
+  right: 12px;
+  width: 10px;
+  height: 10px;
+  background: var(--label-timer);
+  border: 2px solid var(--bg);
+  transform: rotate(45deg);
+  border-radius: 2px;
+}
+.gc-gate-expr {
+  margin: 0;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- tier: loop. ----------------------------------------------------------*/
+
+.gc-node[data-tier="loop"] .gc-badge {
+  border-color: rgba(139, 92, 246, 0.4);
+  color: var(--label-timer);
+}
+.gc-loop-line {
+  margin: 0;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  color: var(--label-timer);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- tier: sub. A card that opens another workflow. ------------------------*/
+
+.gc-node[data-tier="sub"] {
+  border-style: solid;
+  border-color: rgba(59, 130, 246, 0.35);
+}
+.gc-sub-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  align-self: flex-start;
+  padding: 2px 8px;
+  border-radius: var(--r-pill, 999px);
+  border: 1px solid rgba(59, 130, 246, 0.4);
+  background: rgba(59, 130, 246, 0.12);
+  color: var(--label-client);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.gc-sub-chip:hover { background: rgba(59, 130, 246, 0.2); }
+.gc-sub-chip svg { width: 10px; height: 10px; }
+
+/* --- tier: io. http, write, wait. ------------------------------------------*/
+
+.gc-io-line {
+  margin: 0;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- tier: plumbing. log, transform, manual, and anything unclassified. --- */
+
+.gc-node[data-tier="plumbing"] {
+  padding: 6px 9px;
+  background: rgba(255, 255, 255, 0.014);
+  border-color: var(--line-soft);
+  /* No detail line here by design, so centre the one row it has rather than
+     pin it to the top of a box that is still the standard card height. */
+  justify-content: center;
+}
+.gc-node[data-tier="plumbing"] .gc-name { font-size: 11px; font-weight: 500; color: var(--muted); }
+.gc-node[data-tier="plumbing"] .gc-badge { width: 18px; height: 18px; font-size: 8px; }
+.gc-node[data-tier="plumbing"]:hover .gc-name { color: var(--ink); }
+
+/* ----------------------------------------------------------------------------
+   Simplified cards. Below SIMPLIFY_BELOW_ZOOM in graph-canvas.js the detail
+   line is too small to read anyway, so every card drops to badge, colour and
+   name. One attribute on the root flips this for every card at once, so it
+   costs nothing extra during a zoom gesture. This is what makes a very wide
+   graph, seen zoomed out, read as a row of coloured chips instead of a wall
+   of illegible 11px mono.
+   -------------------------------------------------------------------------- */
+
+.gcanvas[data-simplified="1"] .gc-node {
+  padding: 6px 8px;
+  gap: 0;
+}
+.gcanvas[data-simplified="1"] .gc-node[data-tier="prompt"] { padding-left: 8px; }
+.gcanvas[data-simplified="1"] .gc-id,
+.gcanvas[data-simplified="1"] .gc-detail,
+.gcanvas[data-simplified="1"] .gc-prompt-text,
+.gcanvas[data-simplified="1"] .gc-prompt-empty,
+.gcanvas[data-simplified="1"] .gc-sys-chip,
+.gcanvas[data-simplified="1"] .gc-gate-expr,
+.gcanvas[data-simplified="1"] .gc-loop-line,
+.gcanvas[data-simplified="1"] .gc-io-line,
+.gcanvas[data-simplified="1"] .gc-sub-chip {
+  display: none;
+}
+.gcanvas[data-simplified="1"] .gc-name { font-size: 13px; }
+
+/* ----------------------------------------------------------------------------
+   Run state. Flipping one data attribute paints a whole card. No inline style
+   writes here, and no per node work happens on a mouse move, only when
+   setRunState is called.
+   -------------------------------------------------------------------------- */
+
+.gc-node[data-run="done"] {
+  border-color: var(--st-done);
+  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.28);
+}
+.gc-node[data-run="failed"] {
+  border-color: var(--st-failed);
+  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.32);
+}
+.gc-node[data-run="running"] {
+  border-color: var(--st-running);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.3);
+  animation: gc-pulse 1.5s ease-in-out infinite;
+}
+/* Parked. Amber, and it must never pulse. A parked node is not working. */
+.gc-node[data-run="parked"] {
+  border-color: var(--st-waiting);
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.32);
+  animation: none;
+}
+.gc-node[data-run="cancelled"] {
+  border-color: var(--st-cancelled);
+  opacity: 0.7;
+}
+/* Never ran. Dim so a branch that was not taken reads at a glance. */
+.gc-node[data-run="dim"] { opacity: 0.34; }
+.gc-node[data-run="dim"]:hover { opacity: 0.6; }
+
+@keyframes gc-pulse {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.3), 0 0 0 4px rgba(59, 130, 246, 0.16); }
+  50%      { box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.55), 0 0 0 8px rgba(59, 130, 246, 0.05); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gc-node[data-run="running"] { animation: none; }
+}
+
+.gc-node[data-current="1"] {
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--st-running);
+}
+.gc-node[data-current="1"][data-run="failed"] {
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--st-failed);
+}
+.gc-node[data-current="1"][data-run="parked"] {
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--st-waiting);
+}
+.gc-node[data-current="1"][data-run="done"] {
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--st-done);
+}
+
+/* ----------------------------------------------------------------------------
+   Controls, minimap, empty state. None of these live inside the transformed
+   wrapper, so they never move during pan or zoom.
+   -------------------------------------------------------------------------- */
+
+.gcanvas-controls {
+  position: absolute;
+  right: 12px;
+  top: 12px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 12px);
+  background: rgba(20, 24, 29, 0.88);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+.gc-ctrl-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: none;
+  color: var(--muted);
+  font-family: var(--font, sans-serif);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.gc-ctrl-btn:hover { background: rgba(255, 255, 255, 0.08); color: var(--ink); }
+.gc-ctrl-sep { height: 1px; background: var(--line); margin: 2px 3px; }
+.gc-ctrl-reset {
+  width: auto;
+  padding: 0 8px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.gcanvas-minimap {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 5;
+  width: 230px;
+  height: 82px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm, 8px);
+  background: rgba(13, 16, 20, 0.92);
+  overflow: hidden;
+  cursor: grab;
+}
+.gcanvas-minimap:active { cursor: grabbing; }
+.gcanvas-minimap rect.gc-mm-node { fill: var(--ink-faint); }
+.gcanvas-minimap rect.gc-mm-node[data-tier="prompt"] { fill: rgba(245, 158, 11, 0.75); }
+.gcanvas-minimap rect.gc-mm-view {
+  fill: rgba(59, 130, 246, 0.14);
+  stroke: var(--st-running);
+  stroke-width: 1.5;
+}
+
+/* This must win over the author rule below it whenever the [hidden] attribute
+   is set, or the empty state div sits over the whole canvas at full size,
+   invisible, and silently eats every click on every card underneath it. That
+   is a real bug this file shipped with once already: `display: flex` on a
+   class selector has the same specificity as the browser's own `[hidden]`
+   rule, and an author rule beats a user agent rule at a tie, so `hidden`
+   alone was not enough. Caught it by testing an actual mouse drag on a card,
+   not by reading the code. */
+.gcanvas-empty[hidden] { display: none; }
+
+.gcanvas-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  text-align: center;
+  padding: 24px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.gcanvas-empty strong { color: var(--ink); font-size: 14px; font-weight: 640; }
+
+/* Useful once, clutter forever after. Full opacity until the first pan,
+   zoom, drag, or key press, then it fades out. Pointer events stay off so it
+   never sits in the way of panning or a minimap drag in that corner, and
+   hovering anywhere on the canvas brings it back for anyone who wants a
+   reminder, on the assumption that a hover already means the person is not
+   mid gesture. */
+.gcanvas-hint {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  z-index: 5;
+  padding: 4px 9px;
+  border-radius: var(--r-pill, 999px);
+  border: 1px solid var(--line);
+  background: rgba(20, 24, 29, 0.82);
+  color: var(--faint);
+  font-size: 10.5px;
+  white-space: nowrap;
+  opacity: 1;
+  pointer-events: none;
+  transition: opacity 400ms ease;
+}
+.gcanvas[data-interacted="1"] .gcanvas-hint { opacity: 0; }
+.gcanvas[data-interacted="1"]:hover .gcanvas-hint { opacity: 1; }

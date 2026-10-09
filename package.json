@@ -1,0 +1,22 @@
+{
+  "name": "artha-flow",
+  "version": "0.2.0",
+  "description": "Local workflow engine with a live web interface. The AI agent you already run (Claude Code, Codex, any agent with a shell) does the thinking, so there is no API key. Zero dependencies.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "bin": {
+    "aflow": "./bin/aflow"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "doctor": "node bin/aflow doctor",
+    "test": "node --test server"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Eashan1401/artha-flow.git"
+  }
+}
